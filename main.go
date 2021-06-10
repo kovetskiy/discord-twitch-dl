@@ -4,50 +4,83 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/reconquest/karma-go"
 	"github.com/reconquest/pkg/log"
+	"gopkg.in/tucnak/telebot.v2"
 
 	"github.com/bwmarrin/discordgo"
 	"mvdan.cc/xurls/v2"
 )
 
-func main() {
-	token := os.Getenv("TOKEN")
+type Handler struct {
+	ds   *discordgo.Session
+	tg   *telebot.Bot
+	chat *telebot.Chat
+}
 
-	ds, err := discordgo.New("Bot " + token)
+func main() {
+	var (
+		discordToken  = stringEnv("DISCORD_TOKEN")
+		telegramToken = stringEnv("TELEGRAM_TOKEN")
+		telegramChat  = intEnv("TELEGRAM_CHAT")
+	)
+
+	ds, err := discordgo.New("Bot " + discordToken)
 	if err != nil {
 		log.Fatalf(err, "discord session")
 	}
 	defer ds.Close()
 
 	// ds.Identify.Intents = discordgo.IntentsGuildMembers
-	ds.AddHandler(handle)
 
 	err = ds.Open()
 	if err != nil {
 		log.Fatalf(err, "discord open")
 	}
 
+	tg, err := telebot.NewBot(telebot.Settings{
+		Token:  telegramToken,
+		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},
+	})
+	if err != nil {
+		log.Fatalf(err, "telegram connect")
+	}
+
+	handler := &Handler{
+		ds:   ds,
+		tg:   tg,
+		chat: &telebot.Chat{ID: int64(telegramChat)},
+	}
+
+	ds.AddHandler(handler.Handle)
+
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt, os.Kill)
 	<-sc
 }
 
-func handle(session *discordgo.Session, msg *discordgo.MessageCreate) {
+func (handler *Handler) Handle(
+	session *discordgo.Session,
+	msg *discordgo.MessageCreate,
+) {
 	if msg.Author.ID == session.State.User.ID {
 		return
 	}
 
-	url.Parse(msg.Content)
+	if !strings.HasPrefix(msg.Content, "-archive ") {
+		return
+	}
 
 	parser := xurls.Strict()
 
@@ -68,6 +101,8 @@ func handle(session *discordgo.Session, msg *discordgo.MessageCreate) {
 	}
 
 	for _, url := range urls {
+		log.Infof(nil, "find link for %s", url)
+
 		clip, err := getClip(url)
 		if err != nil {
 			log.Errorf(err, "download clip: %s", url)
@@ -82,6 +117,8 @@ func handle(session *discordgo.Session, msg *discordgo.MessageCreate) {
 		defer os.Remove(file.Name())
 		defer file.Close()
 
+		log.Infof(nil, "download %s", clip.DownloadURL)
+
 		err = download(clip.DownloadURL, file)
 		if err != nil {
 			log.Errorf(err, "download: %s %s", url, clip.DownloadURL)
@@ -90,13 +127,9 @@ func handle(session *discordgo.Session, msg *discordgo.MessageCreate) {
 
 		file.Seek(0, 0)
 
-		_, err = session.ChannelFileSend(
-			msg.ChannelID,
-			clip.Broadcaster+": "+clip.Title+".mp4",
-			file,
-		)
+		info, err := file.Stat()
 		if err != nil {
-			log.Errorf(err, "file send")
+			log.Errorf(err, "file stat")
 			continue
 		}
 
@@ -105,7 +138,46 @@ func handle(session *discordgo.Session, msg *discordgo.MessageCreate) {
 			log.Errorf(err, "file close")
 			continue
 		}
+
+		log.Infof(nil, "file size %d", info.Size())
+		log.Infof(nil, "file send")
+
+		video, err := handler.tg.Send(handler.chat, &telebot.Video{
+			FileName: clip.Broadcaster + ": " + clip.Title + ".mp4",
+			File:     telebot.FromDisk(file.Name()),
+			Caption: stringLimit(
+				fmt.Sprintf("%s: %s", clip.Broadcaster, clip.Title),
+				1024,
+			),
+		})
+		if err != nil {
+			log.Errorf(err, "telegram send video")
+			continue
+		}
+
+		videoLink := getPostLink(video)
+		_, err = session.ChannelMessageSendComplex(
+			msg.ChannelID,
+			&discordgo.MessageSend{
+				Content: fmt.Sprintf(
+					"%s\n%s\n%s",
+					clip.Title,
+					clip.Broadcaster,
+					videoLink,
+				),
+			},
+		)
+		if err != nil {
+			log.Errorf(err, "discord send link")
+			continue
+		}
+
+		log.Infof(nil, "finished %s", url)
 	}
+}
+
+func getPostLink(msg *telebot.Message) string {
+	return fmt.Sprintf("https://t.me/%s/%d", msg.Chat.Username, msg.ID)
 }
 
 type Clip struct {
@@ -165,4 +237,42 @@ func download(url string, file *os.File) error {
 
 	_, err = io.Copy(file, resp.Body)
 	return err
+}
+
+func intEnv(key string) int {
+	value := stringEnv(key)
+
+	result, err := strconv.Atoi(value)
+	if err != nil {
+		log.Fatalf(err, "string to int: %s", key)
+	}
+
+	return result
+}
+
+func stringEnv(key string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		log.Fatalf(nil, "no env %q specified", key)
+	}
+
+	return value
+}
+
+func durationEnv(key string) time.Duration {
+	value := stringEnv(key)
+
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		log.Fatalf(err, "parse duration: %s for %s", value, key)
+	}
+
+	return duration
+}
+
+func stringLimit(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
 }
